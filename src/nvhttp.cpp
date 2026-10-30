@@ -1367,13 +1367,16 @@ namespace nvhttp {
     pt::ptree tree;
     auto &root = tree.add_child("root", pt::ptree {});
     root.put("<xmlattr>.status_code", 200);
+    root.put("<xmlattr>.status_message", "OK");
 
-    for (const auto &display : video::enumerate_displays()) {
+    const auto displays = video::enumerate_displays();
+    for (const auto &display : displays) {
       pt::ptree item;
       item.put("id", display.id);
       item.put("name", display.name);
       root.push_back(std::make_pair("display", item));
     }
+    BOOST_LOG(info) << "Returning ["sv << displays.size() << "] capture-supported displays from /displayinfo"sv;
 
     std::ostringstream data;
     pt::write_xml(data, tree);
