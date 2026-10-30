@@ -1469,6 +1469,41 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+
+  std::string validate_display_id(std::string_view requested_id, const std::vector<display_info_t> &displays) {
+    if (requested_id.empty()) {
+      return {};
+    }
+
+    const auto found = std::find_if(std::begin(displays), std::end(displays), [requested_id](const auto &display) {
+      return display.id == requested_id;
+    });
+    return found == std::end(displays) ? std::string {} : found->id;
+  }
+
+  std::vector<display_info_t> enumerate_displays() {
+    std::vector<display_info_t> result;
+#ifdef _WIN32
+    if (!chosen_encoder) {
+      return result;
+    }
+
+    const auto capture_names {platf::display_names(chosen_encoder->platform_formats->dev_type)};
+    for (const auto &device : display_device::enumerate_devices()) {
+      if (device.m_device_id.empty() || device.m_friendly_name.empty() || !device.m_info) {
+        continue;
+      }
+
+      const auto capture_name {display_device::map_output_name(device.m_device_id)};
+      if (capture_name.empty() || std::find(std::begin(capture_names), std::end(capture_names), capture_name) == std::end(capture_names)) {
+        continue;
+      }
+
+      result.push_back({device.m_device_id, device.m_friendly_name});
+    }
+#endif
+    return result;
+  }
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
@@ -1504,10 +1539,12 @@ namespace video {
    * @param dev_type The encoder device type used for display lookup.
    * @param display_names The list of display names to repopulate.
    * @param current_display_index The current display index or -1 if not yet known.
+   * @param requested_display_id Stable ID requested for the initial capture, if any.
    */
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
+  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, std::string_view requested_display_id) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
-    const auto output_name {display_device::map_output_name(config::video.output_name)};
+    const auto output_name {display_device::map_output_name(requested_display_id.empty() ? config::video.output_name : std::string(requested_display_id))};
+    const auto fallback_output_name {display_device::map_output_name(config::video.output_name)};
     std::string current_display_name;
 
     // If we have a current display index, let's start with that
@@ -1544,9 +1581,19 @@ namespace video {
       BOOST_LOG(warning) << "Previous active display ["sv << current_display_name << "] is no longer present"sv;
     } else {
       for (int x = 0; x < display_names.size(); ++x) {
-        if (display_names[x] == output_name) {
+        if (!output_name.empty() && display_names[x] == output_name) {
           current_display_index = x;
           return;
+        }
+      }
+
+      if (!requested_display_id.empty()) {
+        BOOST_LOG(warning) << "Requested display ["sv << requested_display_id << "] is no longer available; falling back to the configured display."sv;
+        for (int x = 0; x < display_names.size(); ++x) {
+          if (!fallback_output_name.empty() && display_names[x] == fallback_output_name) {
+            current_display_index = x;
+            return;
+          }
         }
       }
     }
@@ -1594,7 +1641,7 @@ namespace video {
     // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, capture_ctxs.front().config.display_id);
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
     if (!disp) {
       return;
@@ -1783,7 +1830,7 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, capture_ctxs.front().config.display_id);
 
               // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
@@ -2705,7 +2752,7 @@ namespace video {
 
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, synced_session_ctxs.front()->config.display_id);
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {

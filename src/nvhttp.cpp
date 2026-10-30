@@ -511,6 +511,7 @@ namespace nvhttp {
     }
     launch_session->unique_id = (get_arg(args, "uniqueid", "unknown"));
     launch_session->appid = (int) util::from_view(get_arg(args, "appid", "unknown"));
+    launch_session->display_id = get_arg(args, "display_id", "");
     launch_session->enable_sops = util::from_view(get_arg(args, "sops", "0"));
     launch_session->surround_info = (int) util::from_view(get_arg(args, "surroundAudioInfo", "196610"));
     launch_session->surround_params = (get_arg(args, "surroundParams", ""));
@@ -1359,6 +1360,28 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Return stable IDs for displays supported by the active capture backend.
+   */
+  void displayinfo(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    pt::ptree tree;
+    auto &root = tree.add_child("root", pt::ptree {});
+    root.put("<xmlattr>.status_code", 200);
+
+    for (const auto &display : video::enumerate_displays()) {
+      pt::ptree item;
+      item.put("id", display.id);
+      item.put("name", display.name);
+      root.push_back(std::make_pair("display", item));
+    }
+
+    std::ostringstream data;
+    pt::write_xml(data, tree);
+    response->write(data.str());
+    response->close_connection_after_response = true;
+  }
+
+  /**
    * @brief Launch the requested application for a GameStream session.
    *
    * @param host_audio Host audio.
@@ -1413,6 +1436,15 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
+    const auto requested_display_id = launch_session->display_id;
+    launch_session->display_id = video::validate_display_id(requested_display_id, video::enumerate_displays());
+    if (!requested_display_id.empty() && launch_session->display_id.empty()) {
+      BOOST_LOG(warning) << "Client requested unavailable or unsupported display ["sv << requested_display_id << "]; using the configured display."sv;
+    }
+    if (rtsp_stream::session_count() != 0 && !launch_session->display_id.empty()) {
+      BOOST_LOG(warning) << "Ignoring client display selection because a capture session is already active."sv;
+      launch_session->display_id.clear();
+    }
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1528,6 +1560,15 @@ namespace nvhttp {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
     const auto launch_session = make_launch_session(host_audio, args);
+    const auto requested_display_id = launch_session->display_id;
+    launch_session->display_id = video::validate_display_id(requested_display_id, video::enumerate_displays());
+    if (!requested_display_id.empty() && launch_session->display_id.empty()) {
+      BOOST_LOG(warning) << "Client requested unavailable or unsupported display ["sv << requested_display_id << "]; using the configured display."sv;
+    }
+    if (!no_active_sessions && !launch_session->display_id.empty()) {
+      BOOST_LOG(warning) << "Ignoring client display selection because a capture session is already active."sv;
+      launch_session->display_id.clear();
+    }
 
     if (no_active_sessions) {
       // We want to prepare display only if there are no active sessions at
@@ -1731,6 +1772,7 @@ namespace nvhttp {
       pair<SunshineHTTPS>(resp, req);
     };
     https_server.resource["^/applist$"]["GET"] = applist;
+    https_server.resource["^/displayinfo$"]["GET"] = displayinfo;
     https_server.resource["^/appasset$"]["GET"] = appasset;
     https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
       launch(host_audio, resp, req);

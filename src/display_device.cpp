@@ -1037,7 +1037,7 @@ namespace display_device {
     }
 
     SingleDisplayConfiguration config;
-    config.m_device_id = video_config.output_name;
+    config.m_device_id = session.display_id.empty() ? video_config.output_name : session.display_id;
     config.m_device_prep = *device_prep;
 
     const auto hdr_state {parse_hdr_option(video_config, session)};

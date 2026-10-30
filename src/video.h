@@ -6,7 +6,9 @@
 
 // standard includes
 #include <chrono>
+#include <string>
 #include <string_view>
+#include <vector>
 
 // local includes
 #include "input.h"
@@ -27,6 +29,18 @@ namespace stream {
 
 namespace video {
 
+  /** A display that this build can capture. */
+  struct display_info_t {
+    std::string id;  ///< Stable display device identifier.
+    std::string name;  ///< Human-readable display name.
+  };
+
+  /** Enumerate displays supported by the active capture backend. */
+  [[nodiscard]] std::vector<display_info_t> enumerate_displays();
+
+  /** Return the requested ID when available, otherwise empty for the configured default. */
+  [[nodiscard]] std::string validate_display_id(std::string_view requested_id, const std::vector<display_info_t> &displays);
+
   /**
    * @brief Encoding configuration requested by a remote client.
    */
@@ -43,6 +57,7 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    std::string display_id;  ///< Stable display ID requested when this stream was launched.
   };
 
   namespace amf {
