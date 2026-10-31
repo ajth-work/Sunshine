@@ -110,6 +110,14 @@ namespace nvhttp {
   };
 
   /**
+   * @brief Paired client identity established by the completed HTTPS handshake.
+   */
+  struct client_identity_t {
+    std::string certificate;  ///< Validated client certificate in PEM form.
+    std::string name;  ///< Paired client display name.
+  };
+
+  /**
    * @brief Enumerates supported pAIR PHASE options.
    */
   enum class PAIR_PHASE {
@@ -401,6 +409,20 @@ namespace nvhttp {
      * @return HTTPS server ready for test endpoint configuration.
      */
     std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+    );
+
+    /**
+     * @brief Create an HTTPS server configured with Sunshine's production client identity verifier.
+     *
+     * @param certificate_file Path to the server certificate PEM file.
+     * @param private_key_file Path to the matching private key PEM file.
+     * @param handler_scope Receives the scope runner that prevents destruction during callbacks.
+     * @return HTTPS server ready for test endpoint configuration.
+     */
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_verified_https_server(
       const std::string &certificate_file,
       const std::string &private_key_file,
       std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope

@@ -63,6 +63,14 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Verify a completed TLS peer certificate and resolve its paired client identity.
+   *
+   * @param ssl TLS connection whose handshake has completed.
+   * @return The enabled paired identity, or an empty pointer when the peer is not authorized.
+   */
+  std::shared_ptr<const client_identity_t> identify_https_client(SSL *ssl);
+
+  /**
    * @brief HTTPS server backend that adds Sunshine's client-certificate verification.
    */
   class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
@@ -82,7 +90,7 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
-    std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
+    std::function<std::shared_ptr<const client_identity_t>(SSL *)> verify;  ///< Callback that validates and identifies a client's TLS certificate after handshake.
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
 
   protected:
@@ -111,11 +119,15 @@ namespace nvhttp {
      */
     void handle_handshake(const std::shared_ptr<Session> &session, const SimpleWeb::error_code &ec) {
       if (!ec) {
-        if (verify && !verify(session->connection->socket->native_handle())) {
-          this->write(session, on_verify_failed);
-        } else {
-          this->read(session);
+        if (verify) {
+          auto identity = verify(session->connection->socket->native_handle());
+          if (!identity) {
+            this->write(session, on_verify_failed);
+            return;
+          }
+          session->connection->application_context = std::move(identity);
         }
+        this->read(session);
       } else if (this->on_error) {
         this->on_error(session->request, ec);
       }
@@ -208,10 +220,6 @@ namespace nvhttp {
 
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
-
-  // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
-  std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
-  std::string last_verified_client_name;  ///< Friendly name of last client certificate accepted by the TLS verify callback. // NOSONAR(cpp:S5421): intentionally mutable global
 
   /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
@@ -484,7 +492,7 @@ namespace nvhttp {
    * @param args Arguments forwarded to the callable or parser.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args, const req_https_t &request) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
@@ -529,8 +537,13 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
-    launch_session->client_name = last_verified_client_name;
+    const auto context = request->application_context();
+    if (!context) {
+      return {};
+    }
+    const auto identity = std::static_pointer_cast<const client_identity_t>(context);
+    launch_session->client_cert = identity->certificate;
+    launch_session->client_name = identity->name;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     std::array<unsigned char, 8> raw_payload;
@@ -1412,6 +1425,13 @@ namespace nvhttp {
       }
     });
 
+    if (!request->application_context()) {
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "The client is not authorized.");
+      tree.put("root.gamesession", 0);
+      return;
+    }
+
     auto args = request->parse_query_string();
     if (
       args.find("rikey"s) == std::end(args) ||
@@ -1438,7 +1458,13 @@ namespace nvhttp {
     }
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, request);
+    if (!launch_session) {
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "The client is not authorized.");
+      tree.put("root.gamesession", 0);
+      return;
+    }
     const auto requested_display_id = launch_session->display_id;
     launch_session->display_id = video::validate_display_id(requested_display_id, video::enumerate_displays());
     if (!requested_display_id.empty() && launch_session->display_id.empty()) {
@@ -1534,6 +1560,13 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
+    if (!request->application_context()) {
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "The client is not authorized.");
+      tree.put("root.resume", 0);
+      return;
+    }
+
     auto current_appid = proc::proc.running();
     if (current_appid == 0) {
       tree.put("root.resume", 0);
@@ -1562,7 +1595,13 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio, args, request);
+    if (!launch_session) {
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "The client is not authorized.");
+      tree.put("root.resume", 0);
+      return;
+    }
     const auto requested_display_id = launch_session->display_id;
     launch_session->display_id = video::validate_display_id(requested_display_id, video::enumerate_displays());
     if (!requested_display_id.empty() && launch_session->display_id.empty()) {
@@ -1708,51 +1747,7 @@ namespace nvhttp {
     http_server_t http_server;
 
     // Verify certificates after establishing connection
-    https_server.verify = [](SSL *ssl) {
-      crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
-        SSL_get1_peer_certificate(ssl)
-#else
-        SSL_get_peer_certificate(ssl)
-#endif
-      };
-      if (!x509) {
-        BOOST_LOG(info) << "unknown -- denied"sv;
-        return 0;
-      }
-
-      int verified = 0;
-
-      auto fg = util::fail_guard([&]() {
-        std::array<char, 256> subject_name;
-
-        X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name.data(), subject_name.size());
-
-        BOOST_LOG(debug) << subject_name.data() << " -- "sv << (verified ? "verified"sv : "denied"sv);
-      });
-
-      std::lock_guard lock {client_auth_mutex()};
-      auto err_str = verify_client_certificate(x509.get());
-      if (err_str) {
-        BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
-
-        return verified;
-      }
-
-      // Check if this client is enabled
-      auto pem = crypto::pem(x509);
-      auto [enabled, client_name] = get_client_status(pem);
-      if (!enabled) {
-        BOOST_LOG(info) << "Client is disabled -- denied"sv;
-        return verified;
-      }
-
-      last_verified_client_cert = pem;
-      last_verified_client_name = client_name;
-      verified = 1;
-
-      return verified;
-    };
+    https_server.verify = identify_https_client;
 
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
       pt::ptree tree;
@@ -1883,12 +1878,56 @@ namespace nvhttp {
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem) {
     const client_t &client = client_root;
+    std::pair<bool, std::string> result {false, {}};
     for (const auto &named_cert : client.named_devices) {
       if (named_cert.cert == cert_pem) {
-        return {named_cert.enabled, named_cert.name};
+        if (result.first || !named_cert.enabled) {
+          return {false, {}};
+        }
+        result = {true, named_cert.name};
       }
     }
-    return {true, {}};
+    return result;
+  }
+
+  std::shared_ptr<const client_identity_t> identify_https_client(SSL *ssl) {
+    crypto::x509_t x509 {
+#if OPENSSL_VERSION_MAJOR >= 3
+      SSL_get1_peer_certificate(ssl)
+#else
+      SSL_get_peer_certificate(ssl)
+#endif
+    };
+    if (!x509) {
+      BOOST_LOG(info) << "unknown -- denied"sv;
+      return {};
+    }
+
+    int verified = 0;
+    auto fg = util::fail_guard([&]() {
+      std::array<char, 256> subject_name;
+      X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name.data(), subject_name.size());
+      BOOST_LOG(debug) << subject_name.data() << " -- "sv << (verified ? "verified"sv : "denied"sv);
+    });
+
+    std::lock_guard lock {client_auth_mutex()};
+    if (const auto error = verify_client_certificate(x509.get()); error) {
+      BOOST_LOG(warning) << "SSL Verification error :: "sv << error;
+      return {};
+    }
+
+    auto pem = crypto::pem(x509);
+    auto [enabled, client_name] = get_client_status(pem);
+    if (!enabled) {
+      BOOST_LOG(info) << "Client is disabled -- denied"sv;
+      return {};
+    }
+
+    auto identity = std::make_shared<client_identity_t>();
+    identity->certificate = std::move(pem);
+    identity->name = std::move(client_name);
+    verified = 1;
+    return identity;
   }
 
 #ifdef SUNSHINE_TESTS
@@ -1908,6 +1947,27 @@ namespace nvhttp {
       };
 
       auto server = std::make_unique<test_https_server_t>(certificate_file, private_key_file);
+      handler_scope = server->handler_runner;
+      return server;
+    }
+
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_verified_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+    ) {
+      class test_https_server_t: public SunshineHTTPSServer {
+      public:
+        using SunshineHTTPSServer::handler_runner;
+        using SunshineHTTPSServer::SunshineHTTPSServer;
+      };
+
+      auto server = std::make_unique<test_https_server_t>(certificate_file, private_key_file);
+      server->verify = identify_https_client;
+      server->on_verify_failed = [](auto response, auto) {
+        response->write(SimpleWeb::StatusCode::client_error_unauthorized, "unauthorized");
+        response->close_connection_after_response = true;
+      };
       handler_scope = server->handler_runner;
       return server;
     }
