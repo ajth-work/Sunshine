@@ -115,6 +115,7 @@ namespace nvhttp {
   struct client_identity_t {
     std::string certificate;  ///< Validated client certificate in PEM form.
     std::string name;  ///< Paired client display name.
+    std::string id;  ///< Stable lowercase SHA-256 identity for safe per-client storage.
   };
 
   /**
@@ -426,6 +427,14 @@ namespace nvhttp {
       const std::string &certificate_file,
       const std::string &private_key_file,
       std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+    );
+
+    /**
+     * @brief Install the production paired-client diagnostics handler on an HTTPS test server.
+     * @param server HTTPS server that uses Sunshine's production certificate verifier.
+     */
+    void install_client_diagnostics_endpoint(
+      SimpleWeb::ServerBase<SunshineHTTPS> &server
     );
 
     /**

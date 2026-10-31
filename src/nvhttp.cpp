@@ -11,7 +11,10 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <mutex>
+#include <random>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -49,6 +52,211 @@ namespace nvhttp {
 
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
+
+  static constexpr std::size_t CLIENT_DIAGNOSTIC_BODY_LIMIT = 256 * 1024;
+
+  /**
+   * @brief Validate an upload identifier as 128-bit lowercase hexadecimal.
+   */
+  static bool valid_diagnostic_id(const std::string &value) {
+    return value.size() == 32 && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+             return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+  }
+
+  /**
+   * @brief Validate a 256-bit lowercase hexadecimal identity derived from an authenticated client certificate.
+   * @param value Candidate identity directory name.
+   * @return `true` when the value is exactly a SHA-256 hexadecimal string.
+   */
+  static bool valid_client_diagnostic_identity(const std::string &value) {
+    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+             return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+  }
+
+  /**
+   * @brief Receive one bounded diagnostics snapshot from the authenticated TLS client.
+   * @details The GameStream server has already attached the immutable, verified
+   * paired-client identity to this request. The file path is derived only from
+   * that identity and validated random identifiers in the metadata.
+   */
+  template<class Response, class Request>
+  static void client_diagnostics(Response response, Request request) {
+    auto deny = [&](SimpleWeb::StatusCode status, const char *message) {
+      response->write(status, message);
+      response->close_connection_after_response = true;
+    };
+    if (request->method != "POST" || !request->application_context()) {
+      deny(SimpleWeb::StatusCode::client_error_forbidden, "paired HTTPS client required");
+      return;
+    }
+    if (request->content.size() > CLIENT_DIAGNOSTIC_BODY_LIMIT) {
+      deny(SimpleWeb::StatusCode::client_error_payload_too_large, "body too large");
+      return;
+    }
+    const auto identity = std::static_pointer_cast<const client_identity_t>(request->application_context());
+    if (!identity || !valid_client_diagnostic_identity(identity->id)) {
+      deny(SimpleWeb::StatusCode::client_error_forbidden, "paired identity unavailable");
+      return;
+    }
+
+    pt::ptree metadata;
+    try {
+      std::istringstream input(request->content.string());
+      pt::read_json(input, metadata);
+    } catch (const std::exception &) {
+      deny(SimpleWeb::StatusCode::client_error_bad_request, "malformed metadata");
+      return;
+    }
+    static const std::set<std::string> fields = {
+      "version",
+      "scope",
+      "upload_id",
+      "session_id",
+      "parent_id",
+      "begin",
+      "end",
+      "build",
+      "outcome",
+      "truncated",
+      "content"
+    };
+    for (const auto &field : metadata) {
+      if (!fields.contains(field.first) || !field.second.empty()) {
+        deny(SimpleWeb::StatusCode::client_error_bad_request, "invalid metadata fields");
+        return;
+      }
+    }
+    std::string scope, upload_id, session_id, parent_id, begin, end, build, outcome, content;
+    bool truncated = false;
+    try {
+      if (metadata.size() != fields.size() || metadata.get<int>("version", 0) != 1) {
+        deny(SimpleWeb::StatusCode::client_error_bad_request, "unsupported metadata");
+        return;
+      }
+      scope = metadata.get<std::string>("scope");
+      upload_id = metadata.get<std::string>("upload_id");
+      session_id = metadata.get<std::string>("session_id");
+      parent_id = metadata.get<std::string>("parent_id");
+      begin = metadata.get<std::string>("begin");
+      end = metadata.get<std::string>("end");
+      build = metadata.get<std::string>("build");
+      outcome = metadata.get<std::string>("outcome");
+      content = metadata.get<std::string>("content");
+      truncated = metadata.get<bool>("truncated");
+    } catch (const std::exception &) {
+      deny(SimpleWeb::StatusCode::client_error_bad_request, "invalid metadata values");
+      return;
+    }
+    auto safe_text = [](const std::string &text, std::size_t max) {
+      return !text.empty() && text.size() <= max && std::all_of(text.begin(), text.end(), [](unsigned char c) {
+        return c >= 0x20 && c != 0x7f;
+      });
+    };
+    auto epoch_seconds = [](const std::string &text, unsigned long long &value) {
+      if (text.empty() || text.size() > 20 || !std::all_of(text.begin(), text.end(), [](unsigned char c) {
+            return c >= '0' && c <= '9';
+          })) {
+        return false;
+      }
+      try {
+        value = std::stoull(text);
+        return std::to_string(value) == text;
+      } catch (const std::exception &) {
+        return false;
+      }
+    };
+    static const std::set<std::string> outcomes = {
+      "stream_returned",
+      "user_left_host",
+      "app_exit",
+      "unpair",
+      "manual_current_host",
+      "host_init_failed",
+      "pair_action",
+      "quit_stream"
+    };
+    unsigned long long begin_epoch = 0, end_epoch = 0;
+    const auto content_type = request->header.find("Content-Type");
+    if ((scope != "host" && scope != "stream") || !valid_diagnostic_id(upload_id) || !valid_diagnostic_id(session_id) || (scope == "stream" && !valid_diagnostic_id(parent_id)) || (scope == "host" && !parent_id.empty()) || !safe_text(begin, 40) || !safe_text(end, 40) || !epoch_seconds(begin, begin_epoch) || !epoch_seconds(end, end_epoch) || end_epoch < begin_epoch || !safe_text(build, 64) || !std::all_of(build.begin(), build.end(), [](unsigned char c) {
+          return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+        }) ||
+        !outcomes.contains(outcome) || content_type == request->header.end() || content_type->second != "application/json" || !request->query_string.empty() || content.size() > CLIENT_DIAGNOSTIC_BODY_LIMIT) {
+      deny(SimpleWeb::StatusCode::client_error_bad_request, "invalid diagnostic metadata");
+      return;
+    }
+
+    const fs::path directory = platf::appdata() / "moonlight-client-logs" / identity->id;
+    const auto filename = begin + "-" + scope + "-" + session_id + "-" + upload_id + ".json";
+    const fs::path target = directory / filename;
+    fs::path temporary;
+    try {
+      fs::create_directories(directory);
+      const auto upload_suffix = "-" + upload_id + ".json";
+      for (const auto &entry : fs::directory_iterator(directory)) {
+        const auto existing_name = entry.path().filename().string();
+        if (entry.is_regular_file() && entry.path().extension() == ".json" && existing_name.ends_with(upload_suffix)) {
+          response->write(SimpleWeb::StatusCode::success_ok, "duplicate");
+          return;
+        }
+      }
+      if (fs::exists(target)) {
+        response->write(SimpleWeb::StatusCode::success_ok, "duplicate");
+        return;
+      }
+      std::random_device random;
+      temporary = directory / ("." + filename + "-" + std::to_string(random()) + ".tmp");
+      {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) {
+          throw std::runtime_error("temporary file open failed");
+        }
+        output << request->content.string();
+        output.flush();
+        if (!output) {
+          throw std::runtime_error("temporary file write failed");
+        }
+      }
+      fs::rename(temporary, target);
+      std::vector<fs::directory_entry> uploads;
+      for (const auto &entry : fs::directory_iterator(directory)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json") {
+          uploads.push_back(entry);
+        }
+      }
+      std::sort(uploads.begin(), uploads.end(), [](const auto &a, const auto &b) {
+        return a.last_write_time() > b.last_write_time();
+      });
+      for (std::size_t i = 20; i < uploads.size(); ++i) {
+        fs::remove(uploads[i]);
+      }
+      BOOST_LOG(info) << "Saved paired client diagnostics client="sv << identity->id
+                      << " scope="sv << scope << " session="sv << session_id
+                      << " bytes="sv << request->content.size() << " truncated="sv
+                      << truncated << " path="sv << target.string();
+      response->write(SimpleWeb::StatusCode::success_ok, "saved");
+    } catch (const std::exception &) {
+      if (!temporary.empty()) {
+        std::error_code cleanup_error;
+        fs::remove(temporary, cleanup_error);
+      }
+      deny(SimpleWeb::StatusCode::server_error_internal_server_error, "diagnostic storage failed");
+    }
+  }
+
+  /**
+   * @brief Register the bounded paired-client diagnostics receiver on an HTTPS GameStream server.
+   * @param server HTTPS server receiving the production endpoint.
+   */
+  template<class Server>
+  static void register_client_diagnostics_endpoint(Server &server) {
+    server.config.max_request_streambuf_size = CLIENT_DIAGNOSTIC_BODY_LIMIT;
+    server.resource["^/client-diagnostics$"]["POST"] = [](auto response, auto request) {
+      client_diagnostics(response, request);
+    };
+  }
 
   crypto::cert_chain_t cert_chain;  ///< Enabled paired-client certificates accepted by Sunshine's GameStream HTTPS server.
 
@@ -1771,6 +1979,7 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/displayinfo$"]["GET"] = displayinfo;
+    register_client_diagnostics_endpoint(https_server);
     https_server.resource["^/appasset$"]["GET"] = appasset;
     https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
       launch(host_audio, resp, req);
@@ -1926,12 +2135,20 @@ namespace nvhttp {
     auto identity = std::make_shared<client_identity_t>();
     identity->certificate = std::move(pem);
     identity->name = std::move(client_name);
+    identity->id = util::hex_vec(crypto::hash(identity->certificate));
+    std::transform(identity->id.begin(), identity->id.end(), identity->id.begin(), [](unsigned char c) {
+      return c >= 'A' && c <= 'F' ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
+    });
     verified = 1;
     return identity;
   }
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    void install_client_diagnostics_endpoint(SimpleWeb::ServerBase<SunshineHTTPS> &server) {
+      register_client_diagnostics_endpoint(server);
+    }
+
     std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_https_server(
       const std::string &certificate_file,
       const std::string &private_key_file,

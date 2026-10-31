@@ -8,11 +8,13 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -27,6 +29,8 @@
 #include <src/config.h>
 #include <src/crypto.h>
 #include <src/nvhttp.h>
+#include <src/platform/common.h>
+#include <src/utility.h>
 
 namespace {
   using namespace std::chrono_literals;
@@ -240,6 +244,7 @@ namespace {
       server->io_service = std::make_shared<boost::asio::io_context>();
       server->config.address = "127.0.0.1";
       server->config.port = 0;
+      nvhttp::test_support::install_client_diagnostics_endpoint(*server);
       server->resource["^/identity$"]["GET"] = [this](auto response, auto request) {
         ++handler_calls;
         const auto context = request->application_context();
@@ -341,6 +346,68 @@ namespace {
       return {status, body};
     }
 
+    static std::pair<int, std::string> post_diagnostics(tls_stream_t &stream, const std::string &body) {
+      const std::string request_text = "POST /client-diagnostics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+      boost::asio::write(stream, boost::asio::buffer(request_text));
+      boost::asio::streambuf buffer;
+      boost::asio::read_until(stream, buffer, "\r\n\r\n");
+      std::istream input {&buffer};
+      std::string line;
+      std::getline(input, line);
+      const int status = std::stoi(line.substr(line.find(' ') + 1, 3));
+      std::size_t content_length = 0;
+      while (std::getline(input, line) && line != "\r") {
+        if (line.starts_with("Content-Length:")) {
+          content_length = static_cast<std::size_t>(std::stoul(line.substr(15)));
+        }
+      }
+      std::string response(content_length, '\0');
+      const auto buffered = std::min(content_length, buffer.size());
+      if (buffered) {
+        input.read(response.data(), static_cast<std::streamsize>(buffered));
+      }
+      if (buffered < content_length) {
+        boost::asio::read(stream, boost::asio::buffer(response.data() + buffered, content_length - buffered));
+      }
+      return {status, response};
+    }
+
+    std::pair<int, std::string> reject_oversized_diagnostics() {
+      auto connection = connect(first_certificate_file, first_key_file);
+      const std::string headers = "POST /client-diagnostics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 262145\r\nConnection: close\r\n\r\n";
+      boost::asio::write(*connection->stream, boost::asio::buffer(headers));
+      boost::asio::streambuf buffer;
+      try {
+        boost::asio::read_until(*connection->stream, buffer, "\r\n\r\n");
+      } catch (const boost::system::system_error &error) {
+        if (error.code() == boost::asio::error::eof) {
+          return {0, {}};
+        }
+        throw;
+      }
+      std::istream input {&buffer};
+      std::string line;
+      std::getline(input, line);
+      return {std::stoi(line.substr(line.find(' ') + 1, 3)), {}};
+    }
+
+    static std::string diagnostic_body(const std::string &upload_id, const std::string &scope = "host", const std::string &session_id = "00000000000000000000000000000002", const std::string &parent_id = "", const std::string &content = "safe diagnostic line\n") {
+      nlohmann::json body = {
+        {"version", 1},
+        {"scope", scope},
+        {"upload_id", upload_id},
+        {"session_id", session_id},
+        {"parent_id", parent_id},
+        {"begin", "100"},
+        {"end", "200"},
+        {"build", "3.6.0-gui16"},
+        {"outcome", "user_left_host"},
+        {"truncated", false},
+        {"content", content}
+      };
+      return body.dump();
+    }
+
     std::shared_ptr<SimpleWeb::ScopeRunner> handler_scope;  ///< Production HTTPS handler lifetime guard.
     std::unique_ptr<SimpleWeb::ServerBase<nvhttp::SunshineHTTPS>> server;  ///< Loopback HTTPS server using production verification.
     std::jthread server_thread;  ///< Runs the server's asynchronous I/O context.
@@ -436,5 +503,75 @@ namespace {
       EXPECT_EQ(request(*stream->stream, buffer).first, 401);
     }
     EXPECT_EQ(handler_calls, before);
+  }
+
+  /**
+   * @brief Diagnostic uploads use the verified request identity, reject unsafe metadata and retain only twenty files.
+   */
+  TEST_F(HttpsClientIdentityTest, ClientDiagnosticsArePairedBoundedIdempotentAndRetainedPerIdentity) {
+    auto first_id = util::hex_vec(crypto::hash(first_credentials.x509));
+    auto second_id = util::hex_vec(crypto::hash(second_credentials.x509));
+    auto lowercase = [](unsigned char c) {
+      return c >= 'A' && c <= 'F' ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
+    };
+    std::transform(first_id.begin(), first_id.end(), first_id.begin(), lowercase);
+    std::transform(second_id.begin(), second_id.end(), second_id.begin(), lowercase);
+    const auto root = platf::appdata() / "moonlight-client-logs";
+    const auto first_directory = root / first_id;
+    const auto second_directory = root / second_id;
+    std::filesystem::remove_all(first_directory);
+    std::filesystem::remove_all(second_directory);
+
+    auto post_as = [&](const std::filesystem::path &certificate, const std::filesystem::path &key, const std::string &payload) {
+      auto connection = connect(certificate, key);
+      return post_diagnostics(*connection->stream, payload);
+    };
+    const std::string valid_id = "00000000000000000000000000000001";
+    const auto body = diagnostic_body(valid_id);
+    const auto first_response = post_as(first_certificate_file, first_key_file, body);
+    EXPECT_EQ(first_response.first, 200) << first_response.second;
+    const auto saved = first_directory / ("100-host-00000000000000000000000000000002-" + valid_id + ".json");
+    ASSERT_TRUE(std::filesystem::exists(saved));
+    std::ifstream saved_input(saved, std::ios::binary);
+    const std::string saved_content((std::istreambuf_iterator<char>(saved_input)), {});
+    saved_input.close();
+    EXPECT_EQ(saved_content, body);
+    EXPECT_EQ(post_as(first_certificate_file, first_key_file, body).first, 200);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(first_directory), std::filesystem::directory_iterator {}), 1);
+
+    EXPECT_EQ(post_as(first_certificate_file, first_key_file, "{\"version\":1}").first, 400);
+    const auto traversal = diagnostic_body("../" + std::string(29, 'a'));
+    EXPECT_EQ(post_as(first_certificate_file, first_key_file, traversal).first, 400);
+    EXPECT_EQ(post_as(first_certificate_file, first_key_file, diagnostic_body("00000000000000000000000000000003", "bad")).first, 400);
+    auto invalid_time = nlohmann::json::parse(diagnostic_body("00000000000000000000000000000004"));
+    invalid_time["begin"] = "not-an-epoch";
+    EXPECT_EQ(post_as(first_certificate_file, first_key_file, invalid_time.dump()).first, 400);
+    auto invalid_outcome = nlohmann::json::parse(diagnostic_body("00000000000000000000000000000005"));
+    invalid_outcome["outcome"] = "arbitrary value";
+    EXPECT_EQ(post_as(first_certificate_file, first_key_file, invalid_outcome.dump()).first, 400);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(first_directory), std::filesystem::directory_iterator {}), 1);
+
+    const auto oversized_result = reject_oversized_diagnostics();
+    EXPECT_TRUE(oversized_result.first == 413 || oversized_result.first == 0);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(first_directory), std::filesystem::directory_iterator {}), 1);
+
+    for (unsigned int i = 4; i < 26; ++i) {
+      std::ostringstream id;
+      id << std::string(28, '0') << std::hex << std::setw(4) << std::setfill('0') << i;
+      EXPECT_EQ(post_as(first_certificate_file, first_key_file, diagnostic_body(id.str())).first, 200);
+    }
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(first_directory), std::filesystem::directory_iterator {}), 20);
+    for (const auto &entry : std::filesystem::directory_iterator(first_directory)) {
+      EXPECT_NE(entry.path().extension(), ".tmp");
+    }
+
+    EXPECT_EQ(post_as(first_certificate_file, first_key_file, diagnostic_body("0000000000000000000000000000001a", "stream", "00000000000000000000000000000002", "00000000000000000000000000000003")).first, 200);
+
+    EXPECT_EQ(post_as(second_certificate_file, second_key_file, diagnostic_body(valid_id)).first, 200);
+    EXPECT_TRUE(std::filesystem::exists(second_directory / ("100-host-00000000000000000000000000000002-" + valid_id + ".json")));
+
+    EXPECT_EQ(post_as(unknown_certificate_file, unknown_key_file, diagnostic_body(valid_id)).first, 401);
+    std::filesystem::remove_all(first_directory);
+    std::filesystem::remove_all(second_directory);
   }
 }  // namespace

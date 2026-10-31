@@ -56,6 +56,14 @@ the local server or any mobile device.
 
 LizardByte has the full documentation hosted on [Read the Docs](https://docs.lizardbyte.dev/projects/sunshine)
 
+## Moonlight client diagnostic uploads
+
+Sunshine accepts diagnostic snapshots only through paired HTTPS `POST /client-diagnostics` requests on its GameStream server. The request must use an enabled paired Moonlight client certificate. Uploads are stored separately from the server log under `<Sunshine appdata>/moonlight-client-logs/<paired-client-id>/`; Sunshine's own log remains `<Sunshine appdata>/sunshine.log`. Sunshine keeps the newest 20 uploads per paired client and logs safe metadata plus the saved path, never the uploaded payload. This receiver is not exposed through an unauthenticated Web UI route.
+
+Moonlight asks once per paired host before automatic uploads, provides a manual current-host-session action, and retains its local copy on the SD card. Uploads require Moonlight's saved paired Sunshine certificate pin; a missing or changed pin prevents transfer. The client caps automatic snapshots at 256 KiB, truncates on line boundaries, redacts secrets, and sends directly to this Sunshine host without a relay. The route accepts format version 1 and stores each upload as a separate file.
+
+For troubleshooting, first read the Moonlight and Sunshine README log sections. Check the newest file in `<Sunshine appdata>/moonlight-client-logs/<paired-client-id>/`, then correlate its host-session/stream-session IDs and timestamps with `<Sunshine appdata>/sunshine.log`. If no upload arrived, ask for the Moonlight SD-card files `sdmc:/3ds/moonlight/moonlight.log` and `sdmc:/3ds/moonlight/sessions/`.
+
 * [Stable Docs](https://docs.lizardbyte.dev/projects/sunshine/latest/)
 * [Beta Docs](https://docs.lizardbyte.dev/projects/sunshine/master/)
 
